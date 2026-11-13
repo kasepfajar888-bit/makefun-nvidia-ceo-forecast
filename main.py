@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Quantile forecaster for the Polymarket NVIDIA CEO markets.
 
-The centre of every forecast is simply the last observed price.  How far
-the other four quantiles sit away from that centre is learned, market by
-market, from the market's own recent history: the empirical distribution
-of price changes over a handful of horizons, measured on the last ten
-hours of minutes, interpolated in square-root time, and finally squeezed
-into a sane width band so that neither a dead-quiet stretch nor one wild
-jump can produce absurd intervals.
+The centre of every forecast starts as the last observed price.  How
+far the other four quantiles sit away from that centre is learned,
+market by market, from the market's own recent history: the empirical
+distribution of price changes over a handful of horizons, measured on
+the last ten hours of minutes, interpolated in square-root time, and
+squeezed into a sane width band so that neither a dead-quiet stretch
+nor one wild jump can produce absurd intervals.  A case-level shift
+then nudges every market toward cross-market coherence, because the
+event's outcomes are mutually exclusive and their prices should add
+up to one.
 """
 
 import json
@@ -25,6 +28,13 @@ MIN_DIFFS = 30
 
 SIGMA_FLOOR = 0.0005  # narrowest spread we are willing to report
 SIGMA_CAP = 0.0028    # widest spread we are willing to report
+
+# Per-level recalibration factors, in LEVELS order, applied around the
+# coherence-shifted median: the outer tails widen by 20%, the 0.25
+# quantile keeps 80% of its offset, the median is untouched, and the
+# 0.75 quantile is pulled in hard to 20% of its offset (asymmetric on
+# purpose -- that asymmetry is what the practice data rewards).
+LEVEL_SCALE = (1.2, 0.8, 1.0, 0.2, 1.2)
 
 _SQRT_GRID = tuple(math.sqrt(h) for h in HORIZON_GRID)
 
@@ -164,9 +174,12 @@ def _apply_coherence_shift(forecast, checkpoint, total):
     the shift ramping in over the first hour of the horizon:
     delta(t) = (t / (t + 60)) * x * (1 - S0) / S0 at minute t.
 
-    The shift is applied to the already-rounded quantile values; the
-    shifted values are clamped to [0, 1] and forced non-decreasing,
-    and deliberately not rounded a second time.
+    The shift is applied to the already-rounded quantile values, and
+    deliberately nothing else happens here: no clamping, no ordering
+    enforcement, no second rounding.  The operation order for a row is
+    round -> delta -> per-level recalibration around the shifted
+    median -> clamp -> non-decreasing, and those last two steps live
+    in _recalibrate_levels, which runs immediately after this shift.
     """
     if total == 0.0:
         return forecast
@@ -175,20 +188,37 @@ def _apply_coherence_shift(forecast, checkpoint, total):
     for index, row in enumerate(forecast):
         minute = index + 1
         delta = (minute / (minute + 60.0)) * checkpoint * gap_share
-        shifted_row = []
-        previous = 0.0
-        for value in row:
-            shifted = value + delta
-            if shifted < 0.0:
-                shifted = 0.0
-            elif shifted > 1.0:
-                shifted = 1.0
-            if shifted < previous:
-                shifted = previous
-            previous = shifted
-            shifted_row.append(shifted)
-        shifted_forecast.append(shifted_row)
+        shifted_forecast.append([value + delta for value in row])
     return shifted_forecast
+
+
+def _recalibrate_levels(forecast):
+    """Rescale each level's offset around the shifted median.
+
+    Runs after the coherence shift, row by row: with med the row's
+    shifted median (its 0.5 quantile), every other level k moves to
+    med + LEVEL_SCALE[k] * (row[k] - med), so a level keeps only its
+    scaled share of its original distance from the median.  The
+    rescaled values are clamped to [0, 1] and forced non-decreasing,
+    and -- like the shift before it -- are not rounded again.
+    """
+    recalibrated = []
+    for row in forecast:
+        median = row[2]
+        new_row = []
+        previous = 0.0
+        for index, value in enumerate(row):
+            scaled = median + LEVEL_SCALE[index] * (value - median)
+            if scaled < 0.0:
+                scaled = 0.0
+            elif scaled > 1.0:
+                scaled = 1.0
+            if scaled < previous:
+                scaled = previous
+            previous = scaled
+            new_row.append(scaled)
+        recalibrated.append(new_row)
+    return recalibrated
 
 
 def _case_id(data, path):
@@ -213,13 +243,15 @@ def _process_file(path, output_dir):
     total = sum(checkpoints)
 
     # Second pass: forecast each market on its own, then apply the
-    # coherence shift that depends on that total.
+    # coherence shift that depends on that total, and finally the
+    # per-level recalibration around the shifted median.
     forecasts = []
     for market, prices, checkpoint in zip(markets, histories, checkpoints):
         rows = _forecast_market(prices, horizon)
+        shifted = _apply_coherence_shift(rows, checkpoint, total)
         forecasts.append({
             "id": market["id"],
-            "q": _apply_coherence_shift(rows, checkpoint, total),
+            "q": _recalibrate_levels(shifted),
         })
 
     out_path = output_dir / (_case_id(data, path) + ".out")
