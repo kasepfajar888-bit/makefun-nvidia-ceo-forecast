@@ -20,11 +20,11 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_SCORES = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
 
 HORIZON_GRID = (1, 2, 3, 5, 8, 12, 18, 27, 40, 60, 90, 135, 180, 240)
-WINDOW_MINUTES = 1440
+WINDOW_MINUTES = 420
 MIN_DIFFS = 30
 
-SIGMA_FLOOR = 0.0016  # narrowest spread we are willing to report
-SIGMA_CAP = 0.0025    # widest spread, matching the house baseline
+SIGMA_FLOOR = 0.0005  # narrowest spread we are willing to report
+SIGMA_CAP = 0.0032    # widest spread, matching the house baseline
 
 _SQRT_GRID = tuple(math.sqrt(h) for h in HORIZON_GRID)
 
